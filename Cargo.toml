@@ -1,6 +1,16 @@
 [package]
 name = "mini-tokio"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+
+[dev-dependencies]
+
+# Dependencies will be added here as we progress through steps:
+#
+# Step 3 (I/O reactor):
+#   mio = { version = "1", features = ["os-poll", "net"] }
+#
+# Step 4 (work-stealing):
+#   crossbeam-deque = "0.8"
