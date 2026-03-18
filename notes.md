@@ -455,3 +455,82 @@ this one small, type-erased object.
 For Step 1 of mini-tokio there is no I/O driver — the waker just calls
 `thread::unpark()`. But the contract is identical: someone stores the waker,
 an event happens, `wake()` is called.
+
+---
+
+## std vs Executor: Division of Responsibilities
+
+### std provides the interface (no runtime)
+
+Everything needed to **define** async code and the waker contract:
+
+| Provided by std          | Purpose                                      |
+|--------------------------|----------------------------------------------|
+| `Future` trait + `Poll`  | What to poll, what it returns                |
+| `Waker` + `RawWaker`    | Type-erased callback handle ("poll me again")|
+| `RawWakerVTable`         | 4 function pointers: clone/wake/wake_by_ref/drop |
+| `Context`                | Carries the Waker into `poll()`              |
+| `Pin`                    | Safety for self-referential futures           |
+
+std gives you all the **interface** — but no executor, no scheduler, no I/O loop.
+
+### The executor provides the implementation
+
+What Tokio (or any runtime) builds on top of std:
+
+| Executor decides         | Example (Tokio)                              |
+|--------------------------|----------------------------------------------|
+| When to poll futures     | Worker loop drains run queue                 |
+| Where to store tasks     | Per-worker deque + global inject queue        |
+| How to schedule threads  | Work-stealing across N workers               |
+| How to integrate OS I/O  | mio → epoll/kqueue, ScheduledIo per fd       |
+| How to handle timers     | Hierarchical timer wheel                     |
+| What `data` in Waker is  | Pointer to Task Header                       |
+
+**Any program can build its own executor** using only std primitives.
+That's exactly what mini-tokio does.
+
+---
+
+## Why Tokio Can't Use a Concrete Waker Type
+
+Two reasons the vtable indirection is unavoidable:
+
+### 1. `Waker` is defined in std, not in Tokio
+
+`Future::poll` signature is fixed in the standard library:
+
+```rust
+fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T>
+```
+
+`Context` holds a `std::task::Waker`. Every future in the ecosystem — Tokio's,
+third-party crates, your own — receives this type. std can't hardcode any
+executor's task type.
+
+### 2. Even within Tokio, the task type is generic
+
+`Task<T: Future>` has a different concrete type per spawned future. The `Header`
+is the non-generic prefix that all tasks share. The vtable erases `T` so the
+scheduler can handle all tasks uniformly through `*const Header`.
+
+**The vtable is the price of one universal `Future` trait across all executors.**
+
+---
+
+## What the Waker's `data` Pointer Holds (Across Executors)
+
+The `data: *const ()` in `RawWaker` is executor-specific:
+
+| Executor / context         | `data` points to          | `wake()` does                    |
+|----------------------------|---------------------------|----------------------------------|
+| mini-tokio step 1          | `Arc<Thread>`             | `thread.unpark()`                |
+| mini-tokio step 2+         | task struct pointer       | pushes task onto run queue       |
+| Real Tokio                 | `Task` Header (`NonNull<Header>`) | `RawTask::wake_by_val()` — enqueues task |
+| async-std                  | task pointer              | schedules task for re-poll       |
+| smol                       | `Runnable` handle         | enqueues into executor           |
+| embassy (embedded, no OS)  | task pointer              | marks task ready, no threads     |
+| Trivial executor           | `AtomicBool` pointer      | sets flag to `true`              |
+
+The pattern is always: `data` = "who to wake", vtable = "how to wake them."
+The Waker doesn't know who gave it or why it will be woken.

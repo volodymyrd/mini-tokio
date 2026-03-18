@@ -46,48 +46,112 @@ unsafe fn clone(data: *const ()) -> RawWaker {
 
 /// TODO: implement wake
 /// Receives *const () and consumes it (like Drop + unpark).
-unsafe fn wake(data: *const ()) {}
+unsafe fn wake(data: *const ()) {
+    let thrd = unsafe { Arc::from_raw(data as *const Thread) };
+    thrd.unpark();
+}
 
 /// TODO: implement wake_by_ref
 /// Receives *const () but does NOT consume it — just unparks.
-unsafe fn wake_by_ref(data: *const ()) {}
+unsafe fn wake_by_ref(data: *const ()) {
+    let thrd = unsafe { Arc::from_raw(data as *const Thread) };
+    thrd.unpark();
+    mem::forget(thrd);
+}
 
 /// TODO: implement drop_waker
 /// Receives *const () and drops the Arc without waking.
-unsafe fn drop_waker(data: *const ()) {}
+unsafe fn drop_waker(data: *const ()) {
+    let _ = unsafe { Arc::from_raw(data as *const Thread) };
+}
 
 /// Build a [`Waker`] that unparks `thread` when called.
 ///
 /// TODO: implement this function.
 /// Hint: Box or Arc the Thread, call into_raw(), cast to *const (), build RawWaker.
 pub fn thread_waker(thread: Thread) -> Waker {
-    todo!("build a RawWaker from the Thread and wrap it in a Waker")
+    let thrd = Arc::into_raw(Arc::new(thread)) as *const ();
+    unsafe { Waker::new(thrd, &VTABLE) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::channel;
+    use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
 
     /// Waking must unpark the target thread.
     #[test]
     fn wake_unparks_thread() {
-        // TODO: spawn a thread that parks itself, wake it from here, assert it unblocks.
-        todo!()
+        let unparked = Arc::new(AtomicBool::new(false));
+
+        let (tx, rx) = channel();
+
+        let unparked_cloned = Arc::clone(&unparked);
+        let h = thread::spawn(move || {
+            let ct = thread::current();
+            tx.send(ct).unwrap();
+
+            thread::park();
+
+            unparked_cloned.store(true, Ordering::SeqCst);
+        });
+        let ct = rx.recv().expect("expect current thread");
+        let w = thread_waker(ct);
+        w.wake();
+        h.join().unwrap();
+
+        assert!(
+            unparked.load(Ordering::SeqCst),
+            "thread was not unparked by wake!"
+        );
     }
 
     /// Cloning a waker and waking via the clone must also unpark.
     #[test]
     fn cloned_waker_unparks_thread() {
-        todo!()
+        let unparked = Arc::new(AtomicBool::new(false));
+
+        let (tx, rx) = channel();
+
+        let unparked_cloned = Arc::clone(&unparked);
+        let h = thread::spawn(move || {
+            let ct = thread::current();
+            tx.send(ct).unwrap();
+
+            thread::park();
+
+            unparked_cloned.store(true, Ordering::SeqCst);
+        });
+        let ct = rx.recv().expect("expect current thread");
+        let w = thread_waker(ct);
+        let w_cloned = w.clone();
+        drop(w);
+        w_cloned.wake();
+        h.join().unwrap();
+
+        assert!(
+            unparked.load(Ordering::SeqCst),
+            "thread was not unparked by wake!"
+        );
     }
 
     /// Dropping a waker without waking must not panic or leak.
     #[test]
     fn drop_does_not_wake() {
-        let waker = thread_waker(thread::current());
+        let (tx, rx) = channel();
+        let h = thread::spawn(move || {
+            let ct = thread::current();
+            tx.send(ct).unwrap();
+            thread::park_timeout(Duration::from_millis(50));
+        });
+        let ct = rx.recv().expect("expect current thread");
+        let waker = thread_waker(ct);
         drop(waker);
+        h.join().unwrap();
         // If we reach here without crashing, memory was handled correctly.
     }
 }
