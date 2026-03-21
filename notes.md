@@ -534,3 +534,164 @@ The `data: *const ()` in `RawWaker` is executor-specific:
 
 The pattern is always: `data` = "who to wake", vtable = "how to wake them."
 The Waker doesn't know who gave it or why it will be woken.
+
+---
+
+## Step 1b: `block_on` — Running a Future to Completion
+
+### What `block_on` does
+
+The simplest possible executor: takes **one** future, polls it in a loop on the
+calling thread, and parks the thread between polls. No task queue, no spawning,
+no I/O driver.
+
+```
+block_on(future)
+    │
+    ├─ pin the future (it must not move in memory)
+    ├─ build a Waker that calls thread::unpark()
+    ├─ wrap the Waker in a Context
+    │
+    └─ loop {
+           poll the future with &mut cx
+           Ready(val)  → return val
+           Pending     → thread::park()  ← OS sleeps this thread
+       }                      ▲
+                        waker.wake() unparks it
+```
+
+---
+
+### Pinning: why and how
+
+`Future::poll` requires `Pin<&mut Self>`:
+
+```rust
+fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T>
+```
+
+**Why?** Async blocks compile into state machines that may contain self-references
+(a borrow pointing into the same struct). If the struct moves in memory, those
+internal pointers become dangling. `Pin` is a compile-time guarantee that the
+future **will not be moved** after pinning.
+
+**How to pin for `block_on`:**
+
+Option A — stack pinning with `std::pin::pin!` (preferred, no heap allocation):
+
+```rust
+let mut future = std::pin::pin!(future);
+// future is now Pin<&mut F>, pinned to the stack frame
+// use future.as_mut() to get Pin<&mut F> for each poll call
+```
+
+Option B — heap pinning with `Box::pin` (allocates):
+
+```rust
+let mut future = Box::pin(future);
+// future is Pin<Box<F>>, pinned on the heap
+// use future.as_mut() for polling
+```
+
+For `block_on` stack pinning is ideal — the future lives for the duration of
+the function call and never needs to be sent to another thread.
+
+**Key rule:** after pinning, you can only access the future through
+`Pin<&mut F>`. Use `.as_mut()` each time you poll (it reborrows without moving).
+
+---
+
+### Context: the thin wrapper around Waker
+
+```rust
+// std defines:
+pub struct Context<'a> {
+    waker: &'a Waker,
+    // (+ _marker for lifetime variance)
+}
+```
+
+Create it with:
+
+```rust
+let waker = thread_waker(thread::current());
+let cx = &mut Context::from_waker(&waker);
+```
+
+The future receives `cx` in its `poll` method. Inside, it calls
+`cx.waker().clone()` to save the waker for later use.
+
+**Why `&mut Context` and not just `&Waker`?** Forward compatibility — `Context`
+can be extended with additional fields (e.g., task-local storage) without
+breaking the `Future` trait signature.
+
+---
+
+### The poll loop and spurious wakeups
+
+```rust
+loop {
+    match future.as_mut().poll(cx) {
+        Poll::Ready(val) => return val,
+        Poll::Pending    => thread::park(),
+    }
+}
+```
+
+**Why loop and not just poll once?** Two reasons:
+
+1. **Spurious wakeups** — `thread::park()` may return even if nobody called
+   `unpark()`. The OS or runtime can wake the thread for internal reasons.
+   You must re-poll to check if the future is actually ready.
+
+2. **Multiple pending states** — a future may need several poll cycles to
+   complete (e.g., it returns `Pending` once to register a waker, then
+   `Ready` on the next poll after the event fires).
+
+**Why `as_mut()`?** `poll` takes `self: Pin<&mut Self>` which consumes the
+`Pin<&mut F>`. Calling `.as_mut()` reborrows it — producing a new
+`Pin<&mut F>` without moving the future. Without this, the compiler would
+reject the second poll because the pin was consumed.
+
+---
+
+### Putting it all together — the full `block_on`
+
+```
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    let mut future = pin!(future);          // 1. pin on stack
+    let waker = thread_waker(thread::current()); // 2. build waker
+    let cx = &mut Context::from_waker(&waker);   // 3. build context
+    loop {                                        // 4. poll loop
+        match future.as_mut().poll(cx) {
+            Poll::Ready(val) => return val,
+            Poll::Pending    => thread::park(),
+        }
+    }
+}
+```
+
+Five lines. Every line maps to a concept:
+
+| Line | Concept |
+|------|---------|
+| `pin!(future)` | Self-referential futures must not move after first poll |
+| `thread_waker(thread::current())` | Our waker vtable from Step 1a — wake = unpark |
+| `Context::from_waker(&waker)` | The `poll` API requires a Context, not a bare Waker |
+| `future.as_mut().poll(cx)` | Drive the state machine forward one step |
+| `thread::park()` | Sleep until the waker fires — don't burn CPU spinning |
+
+---
+
+### How it connects to what Tokio does
+
+| Aspect | mini-tokio `block_on` | Tokio `block_on` |
+|--------|----------------------|-------------------|
+| Number of futures | 1 | 1 (but can `spawn` more inside) |
+| Waker data | `Arc<Thread>` | pointer to `Task` header |
+| What `wake()` does | `thread::unpark()` | push task to run queue + unpark worker |
+| Parking | `thread::park()` | `driver.park()` (polls I/O + timers while parked) |
+| Pinning | `pin!` on stack | `Box::pin` in task allocation |
+
+The core loop is the same: poll → pending → park → wake → poll → ready → done.
+Tokio's version just does more work while "parked" (I/O polling, timer ticks).
