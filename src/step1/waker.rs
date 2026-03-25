@@ -16,12 +16,6 @@
 //   - wake_by_ref → wake the thread WITHOUT dropping (borrows self)
 //   - drop   → drop the data pointer without waking
 //
-// TODO: implement the four vtable functions and `thread_waker()`.
-//
-// Hint: the simplest correct approach is to wrap Thread in an Arc so that
-// clone just does Arc::clone and drop just does Arc::decrement.
-// Arc::into_raw / Arc::from_raw let you go between Arc<Thread> and *const ().
-
 use std::mem;
 use std::sync::Arc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -32,7 +26,6 @@ use std::thread::Thread;
 /// define VTABLE as a `static RawWakerVTable` with your four functions.
 static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_waker);
 
-/// TODO: implement clone
 /// Receives *const () pointing to an Arc<Thread>. Must return a new RawWaker
 /// with an independently owned clone of the Arc.
 unsafe fn clone(data: *const ()) -> RawWaker {
@@ -44,14 +37,12 @@ unsafe fn clone(data: *const ()) -> RawWaker {
     RawWaker::new(data, &VTABLE)
 }
 
-/// TODO: implement wake
 /// Receives *const () and consumes it (like Drop + unpark).
 unsafe fn wake(data: *const ()) {
     let thrd = unsafe { Arc::from_raw(data as *const Thread) };
     thrd.unpark();
 }
 
-/// TODO: implement wake_by_ref
 /// Receives *const () but does NOT consume it — just unparks.
 unsafe fn wake_by_ref(data: *const ()) {
     let thrd = unsafe { Arc::from_raw(data as *const Thread) };
@@ -59,16 +50,12 @@ unsafe fn wake_by_ref(data: *const ()) {
     mem::forget(thrd);
 }
 
-/// TODO: implement drop_waker
 /// Receives *const () and drops the Arc without waking.
 unsafe fn drop_waker(data: *const ()) {
     let _ = unsafe { Arc::from_raw(data as *const Thread) };
 }
 
 /// Build a [`Waker`] that unparks `thread` when called.
-///
-/// TODO: implement this function.
-/// Hint: Box or Arc the Thread, call into_raw(), cast to *const (), build RawWaker.
 pub fn thread_waker(thread: Thread) -> Waker {
     let thrd = Arc::into_raw(Arc::new(thread)) as *const ();
     unsafe { Waker::new(thrd, &VTABLE) }

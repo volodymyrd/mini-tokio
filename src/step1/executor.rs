@@ -26,10 +26,11 @@
 
 use std::future::Future;
 use std::task::Context;
+use std::task::Poll;
 use std::thread;
 
 use super::waker::thread_waker;
-
+use core::pin::pin;
 /// Run `future` to completion, blocking the current thread.
 ///
 /// This is the simplest possible async executor: no task queue, no spawning,
@@ -49,15 +50,23 @@ use super::waker::thread_waker;
 /// assert_eq!(result, 2);
 /// ```
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    todo!("pin the future, build a waker + context, poll in a loop")
+    let mut pinned = pin!(future);
+    let waker = thread_waker(thread::current());
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match pinned.as_mut().poll(&mut context) {
+            Poll::Ready(val) => return val,
+            Poll::Pending => thread::park(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::task::Poll;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::Poll;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -80,7 +89,10 @@ mod tests {
 
     impl YieldOnce {
         fn new(waker_slot: Arc<Mutex<Option<std::task::Waker>>>) -> Self {
-            Self { yielded: false, waker: waker_slot }
+            Self {
+                yielded: false,
+                waker: waker_slot,
+            }
         }
     }
 
@@ -102,15 +114,14 @@ mod tests {
     /// Simplest case: an already-ready future.
     #[test]
     fn block_on_ready_future() {
-        // TODO
-        todo!()
+        let f = Ready(Some(42));
+        assert_eq!(block_on(f), 42);
     }
 
     /// An async block that returns a computed value.
     #[test]
     fn block_on_async_block() {
-        // TODO
-        todo!()
+        assert_eq!(block_on(async { 2 + 3 }), 5);
     }
 
     /// A future that yields once (returns Pending) before completing.
@@ -140,14 +151,12 @@ mod tests {
     /// block_on must work with deeply nested async blocks.
     #[test]
     fn block_on_nested_async() {
-        // TODO
-        todo!()
+        assert_eq!(block_on(async { async { async { 2 + 3 }.await }.await }), 5);
     }
 
     /// The output type can be non-Copy (e.g. String).
     #[test]
     fn block_on_returns_string() {
-        // TODO
-        todo!()
+        assert_eq!(block_on(async { String::from("test") }), "test".to_string());
     }
 }
