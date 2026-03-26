@@ -695,3 +695,237 @@ Five lines. Every line maps to a concept:
 
 The core loop is the same: poll → pending → park → wake → poll → ready → done.
 Tokio's version just does more work while "parked" (I/O polling, timer ticks).
+
+---
+
+## Step 2: Spawn — Multi-Task Single-Threaded Scheduler
+
+### The problem
+
+`block_on` runs **one** future. Real programs need hundreds of concurrent tasks
+(connections, timers, background jobs) on a single thread. We need:
+
+1. A way to **submit** new futures (`spawn`)
+2. A **queue** of tasks ready to be polled
+3. A **scheduler loop** that drains the queue
+4. A **waker** that re-enqueues a task when it's ready again
+
+---
+
+### The big shift from Step 1
+
+| | Step 1 (`block_on`) | Step 2 (`spawn`) |
+|---|---|---|
+| Futures | 1, concrete type `F` | Many, different types |
+| Storage | Stack-pinned | Heap-allocated (`Box::pin`) |
+| Waker action | `thread::unpark()` | push task back onto run queue |
+| Type | Generic `F: Future` | Type-erased (all tasks are the same type in the queue) |
+| Completion | Returns `F::Output` | Fire-and-forget (output is discarded or collected via `JoinHandle`) |
+
+---
+
+### Type erasure: why and how
+
+`spawn` accepts any `F: Future<Output = ()>`. But the run queue needs a single
+concrete type. Two options:
+
+**Option A — `dyn Future` (trait object):**
+
+```rust
+type Task = Pin<Box<dyn Future<Output = ()>>>;
+// Queue is VecDeque<Task>
+```
+
+Simple, but the waker needs to push the **same task** back onto the queue.
+A `Pin<Box<dyn Future>>` doesn't know which queue position it came from.
+
+**Option B — `Arc`-based task with self-referencing waker (what Tokio does):**
+
+```rust
+struct Task {
+    future: Mutex<Pin<Box<dyn Future<Output = ()>>>>,
+    queue:  /* reference to the run queue */,
+}
+// Queue is VecDeque<Arc<Task>>
+```
+
+The waker holds an `Arc<Task>` — when `wake()` is called, it clones the Arc
+and pushes it back onto the queue. The task knows how to re-enqueue itself.
+
+---
+
+### Architecture
+
+```
+spawn(future)
+    │
+    ├─ Box::pin(future)              heap-pin the future (type-erased)
+    ├─ wrap in Arc<Task>             shared ownership: queue + waker both hold it
+    └─ push Arc<Task> onto queue     ready to be polled
+
+scheduler loop (inside block_on or run)
+    │
+    └─ loop {
+           while let Some(task) = queue.pop_front() {
+               build Waker from Arc<Task>
+               poll task.future with that Waker
+               Ready  → task is done, Arc drops
+               Pending → waker will re-enqueue when event fires
+           }
+           if queue is empty → park thread (wait for wake)
+       }
+
+waker.wake()
+    │
+    └─ push Arc<Task> back onto queue
+       unpark the scheduler thread
+```
+
+---
+
+### The Task struct
+
+```rust
+struct Task {
+    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    sender: mpsc::Sender<Arc<Task>>,   // handle to re-enqueue ourselves
+}
+```
+
+**Why `Mutex`?** The waker might call `wake()` from another thread. Even though
+our scheduler is single-threaded, the contract says wakers must be `Send + Sync`.
+The `Mutex` makes `Task` safe to share. In practice, only one thread ever locks it.
+
+**Why `Pin<Box<dyn Future>>`?** Two reasons:
+- `Box` puts it on the heap (required — tasks outlive the `spawn` call)
+- `Pin` guarantees the future won't move (required by `poll`)
+- `dyn Future` erases the concrete type (required — queue holds mixed futures)
+
+**Why `mpsc::Sender`?** Simple channel-based queue. `Sender` is `Clone + Send`,
+so the waker can hold a copy and push tasks from anywhere. The scheduler holds
+the `Receiver` end and pops tasks to poll them.
+
+---
+
+### The Waker for Step 2
+
+Step 1's waker called `thread::unpark()`. Step 2's waker must:
+1. Push `Arc<Task>` back onto the run queue
+2. Unpark the scheduler thread (so it wakes up to poll)
+
+```
+RawWaker {
+    data ──► Arc<Task>
+    vtable ──► RawWakerVTable {
+        clone:       Arc::clone the Task
+        wake:        sender.send(arc) + thread::unpark  (consumes)
+        wake_by_ref: sender.send(arc.clone()) + thread::unpark  (borrows)
+        drop:        drop the Arc
+    }
+}
+```
+
+Or — simpler — use the `std::task::Wake` trait (stabilized in Rust 1.51):
+
+```rust
+impl Wake for Task {
+    fn wake(self: Arc<Self>) {
+        self.sender.send(self.clone()).unwrap();
+        // thread::unpark handled by scheduler
+    }
+}
+```
+
+`Arc<Task>` automatically becomes a `Waker` via `Waker::from(arc)`. No manual
+vtable needed! This is a major simplification over Step 1.
+
+---
+
+### Queue options
+
+| Option | Type | Pros | Cons |
+|--------|------|------|------|
+| `VecDeque<Arc<Task>>` + `Mutex` | push/pop manually | Simple, matches Tokio's `current_thread` | Need mutex for cross-thread wake |
+| `mpsc::channel` | `Sender`/`Receiver` | Thread-safe by default, waker just sends | Allocation per send |
+
+For learning, `mpsc::channel` is easiest — the `Sender` is what the waker holds,
+the `Receiver` is what the scheduler drains.
+
+---
+
+### `spawn` function
+
+```rust
+fn spawn<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let task = Arc::new(Task {
+        future: Mutex::new(Box::pin(future)),
+        sender: SENDER.clone(),  // global or passed via context
+    });
+    SENDER.send(task).unwrap();
+}
+```
+
+**`Send + 'static` bounds:** The future might be polled after `spawn` returns
+(hence `'static` — no borrowed data). `Send` because the waker might touch it
+from another thread (even in a single-threaded runtime, the contract requires it).
+
+---
+
+### The scheduler loop
+
+```rust
+fn run(receiver: mpsc::Receiver<Arc<Task>>) {
+    while let Ok(task) = receiver.recv() {   // blocks when queue is empty
+        let waker = Waker::from(task.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut future = task.future.lock().unwrap();
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(()) => {}           // task done, drop it
+            Poll::Pending   => {}           // waker will re-enqueue
+        }
+    }
+}
+```
+
+**Key difference from `block_on`:** we don't loop on one future. We pop tasks,
+poll each once, and move on. If a task is `Pending`, it's the **waker's job**
+to re-enqueue it. If the queue is empty, `recv()` blocks the thread.
+
+---
+
+### How this maps to Tokio's `current_thread` scheduler
+
+| mini-tokio Step 2 | Tokio current_thread |
+|---|---|
+| `Arc<Task>` with `Mutex<Pin<Box<dyn Future>>>` | `Task<T>` with `Header` + `Core<T>` (raw pointer, no mutex on hot path) |
+| `mpsc::channel` | `VecDeque` run queue + inject queue (no channel overhead) |
+| `Waker::from(arc)` using `Wake` trait | Manual `RawWakerVTable` pointing to task header |
+| `receiver.recv()` blocks | `driver.park()` — blocks on I/O + timers while waiting |
+| `spawn` sends to channel | `spawn` pushes to run queue directly |
+
+We trade performance for simplicity. Tokio avoids `Mutex` and channels on the
+hot path, but the architecture is the same.
+
+---
+
+### Files to create
+
+```
+src/step2/
+├── mod.rs          — public API: MiniTokio struct, spawn(), run()
+├── task.rs         — Task struct, Wake impl
+└── tests.rs or inline #[cfg(test)] — scheduler tests
+```
+
+---
+
+### What to test
+
+1. **Spawn a ready future** — spawn one, run scheduler, verify it completes
+2. **Spawn multiple futures** — spawn several, all complete
+3. **Yield and re-schedule** — a future returns Pending once, waker re-enqueues it
+4. **Spawn from within a task** — a running task spawns another task (nested spawn)
+5. **Ordering** — tasks run in FIFO order (first spawned, first polled)
