@@ -4,6 +4,51 @@ A running log of concepts covered during the learning process.
 
 ---
 
+## The Four Actors of Async Rust
+
+Every async runtime is built from four core pieces:
+
+```
+Executor                          Reactor
+(polls tasks)                     (watches for external events)
+    │                                 │
+    │  creates Waker, passes          │  stores Waker,
+    │  it into poll()                 │  calls wake() when event fires
+    │                                 │
+    └──────────► Waker ◄──────────────┘
+                (the bridge)
+                    │
+                    ▼
+                  Task
+          (future + metadata)
+```
+
+| Actor | What it does | Example |
+|---|---|---|
+| **Executor** | Polls tasks, manages the run queue, parks the thread when idle | `block_on` loop, Tokio's `current_thread` scheduler |
+| **Task** | A future wrapped for the executor — heap-allocated, type-erased, can be re-enqueued | `Arc<Task>` holding `Pin<Box<dyn Future>>` |
+| **Waker** | A small, cloneable handle that says "poll this task again" — the only connection between Reactor and Executor | vtable + pointer to task data |
+| **Reactor** | Watches for external events (I/O readiness, timer expiry), calls `waker.wake()` when something happens | mio/epoll driver, timer wheel |
+
+### How they interact — the async lifecycle
+
+1. **Executor** polls a **Task**
+2. Task isn't ready → future stores the **Waker** and returns `Pending`
+3. **Reactor** detects an event (socket readable, timer expired)
+4. Reactor calls `waker.wake()` → task lands back on the executor's run queue
+5. **Executor** polls the **Task** again → `Ready`
+
+### What we build in each step of mini-tokio
+
+| Step | What we add | Actors involved |
+|------|-------------|-----------------|
+| Step 1 | `block_on` + manual `RawWakerVTable` | Executor (minimal), Waker |
+| Step 2 | `spawn`, `Task` struct, run queue | Executor (full), Task, Waker (new: re-enqueues tasks) |
+| Step 3 | I/O driver via mio | Reactor |
+| Step 4 | Work-stealing multi-thread | Executor (multi-threaded) |
+
+---
+
 ## Vtables and Dispatch
 
 ### What is a vtable?
@@ -707,20 +752,54 @@ Tokio's version just does more work while "parked" (I/O polling, timer ticks).
 
 1. A way to **submit** new futures (`spawn`)
 2. A **queue** of tasks ready to be polled
-3. A **scheduler loop** that drains the queue
+3. A loop that drains the queue, polling each task
 4. A **waker** that re-enqueues a task when it's ready again
 
 ---
 
-### The big shift from Step 1
+### What changes from Step 1 — the scheduler emerges
 
-| | Step 1 (`block_on`) | Step 2 (`spawn`) |
+`block_on` doesn't go away — it's still the sync → async entry point that blocks
+the calling thread. What changes is what happens **inside** `block_on`.
+
+In Step 1, `block_on` just polls one future in a loop. In Step 2, it becomes
+something bigger: it manages a queue of tasks, decides which one to poll next,
+and parks the thread when there's no work.
+
+**Naming: executor vs scheduler.** You'll see both words used interchangeably
+in the async Rust world. They refer to the same thing — the loop that polls
+futures. "Executor" is the more common term in Rust (`block_on` is an executor).
+"Scheduler" emphasizes the *choosing* aspect when there are multiple tasks
+("which task do I poll next?"). In Tokio's source code, the module is called
+`scheduler` because it has multiple strategies (current-thread vs multi-thread).
+For our purposes: **executor = scheduler = the loop that polls futures.**
+
+`spawn()` is the new addition — it lets async code submit extra futures to the
+scheduler's queue.
+
+```
+Step 1 block_on:              Step 2 block_on (now a scheduler):
+
+loop {                        spawn(main_future) onto queue
+    poll(future)              loop {
+    Ready → return                while let task = queue.pop() {
+    Pending → park                    poll(task)
+}                                     Ready → done
+                                      Pending → waker will re-enqueue
+                                  }
+                                  queue empty → park, wait for wake
+                              }
+```
+
+The new pieces that `spawn` introduces:
+
+| Concern | Step 1 (no spawn) | Step 2 (with spawn) |
 |---|---|---|
-| Futures | 1, concrete type `F` | Many, different types |
-| Storage | Stack-pinned | Heap-allocated (`Box::pin`) |
-| Waker action | `thread::unpark()` | push task back onto run queue |
-| Type | Generic `F: Future` | Type-erased (all tasks are the same type in the queue) |
-| Completion | Returns `F::Output` | Fire-and-forget (output is discarded or collected via `JoinHandle`) |
+| How many futures | 1, concrete type `F` | Many, different types mixed together |
+| Where futures live | Stack-pinned (`pin!`) | Heap-allocated (`Box::pin`) — must outlive `spawn()` call |
+| Type in the queue | N/A (no queue) | Type-erased `Arc<Task>` wrapping `dyn Future` |
+| What waker does | `thread::unpark()` | push `Arc<Task>` back onto run queue + unpark |
+| How output is returned | `block_on` returns `F::Output` | `spawn` is fire-and-forget (or uses `JoinHandle`) |
 
 ---
 
@@ -736,8 +815,46 @@ type Task = Pin<Box<dyn Future<Output = ()>>>;
 // Queue is VecDeque<Task>
 ```
 
-Simple, but the waker needs to push the **same task** back onto the queue.
-A `Pin<Box<dyn Future>>` doesn't know which queue position it came from.
+Simple, but there's a fundamental ownership problem. Think about what happens
+when the scheduler loop runs:
+
+1. It pops a `Pin<Box<dyn Future>>` from the queue — the future is **moved out**
+2. It polls the future — the future returns `Pending` and stores the waker
+3. Later, `waker.wake()` fires — it needs to put **the same future** back on the queue
+
+But the waker is just a small, cloneable handle (a pointer + vtable). It doesn't
+own the `Pin<Box<dyn Future>>` — the scheduler loop does. And since
+`Pin<Box<dyn Future>>` can't be cloned, the waker has nothing to push back.
+The future is stuck in the scheduler's local variable with no way to re-enqueue it.
+
+`Arc` solves this: both the scheduler loop and the waker hold `Arc<Task>` clones
+pointing to the same heap-allocated task. The scheduler pops its clone to poll,
+but the waker still has its own clone to re-enqueue.
+
+**Why not just `Arc<Pin<Box<dyn Future>>>`?**
+
+Wrapping the future in `Arc` seems like it would solve the ownership problem,
+but it fails on two counts:
+
+1. **Can't poll.** `Future::poll` requires `Pin<&mut Self>` — mutable access.
+   `Arc` only gives `&` (shared reference). You'd need interior mutability:
+
+   ```rust
+   Arc<Mutex<Pin<Box<dyn Future<Output = ()>>>>>
+   ```
+
+2. **Waker doesn't know where to send it.** Even with mutability solved, the
+   waker holds an `Arc<...the future...>` — but `wake()` needs to push it onto
+   a **specific queue**. The future itself has no idea what queue it belongs to:
+
+   ```rust
+   // Inside wake():
+   let task: Arc<...> = ...;  // I have the future...
+   // ...but where do I send it? No Sender, no queue reference.
+   ```
+
+The future alone isn't enough — we need a **struct** that bundles the future
+with the information needed to re-enqueue itself.
 
 **Option B — `Arc`-based task with self-referencing waker (what Tokio does):**
 

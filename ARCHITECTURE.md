@@ -25,7 +25,34 @@ everything ourselves.
 └─────────────────────────────────────────────┘
 ```
 
-### The 5 layers
+### The four actors of async Rust
+
+Every async runtime is built from four core pieces. All of Tokio's layers
+below serve one of these roles:
+
+| Actor | What it does |
+|---|---|
+| **Executor** | Polls tasks, manages the run queue, parks the thread when idle |
+| **Task** | A future wrapped for the executor — heap-allocated, type-erased, can be re-enqueued |
+| **Waker** | A small, cloneable handle that says "poll this task again" — connects Reactor to Executor |
+| **Reactor** | Watches for external events (I/O, timers), calls `waker.wake()` when something happens |
+
+```
+Executor                          Reactor
+(polls tasks)                     (watches for external events)
+    │                                 │
+    │  creates Waker, passes          │  stores Waker,
+    │  it into poll()                 │  calls wake() when event fires
+    │                                 │
+    └──────────► Waker ◄──────────────┘
+                (the bridge)
+                    │
+                    ▼
+                  Task
+          (future + metadata)
+```
+
+### The layers in Tokio
 
 #### 1. `Future` + `Poll` + `Waker` (from `std`)
 
@@ -150,16 +177,22 @@ Future ──poll──► Ready  →  done
 
 Multiple concurrent tasks on one thread. This is the `CurrentThread` runtime.
 
-**Concepts covered:** run queue (`VecDeque`), `Arc`-shared scheduler, waker that
-re-enqueues the task by index or pointer.
+**Concepts covered:** type-erased `Task` struct (`Arc<Task>` holding
+`Pin<Box<dyn Future>>`), `mpsc` channel as run queue, waker that re-enqueues
+the task by pushing `Arc<Task>` back onto the channel.
+
+**Actors introduced:** Task (type-erased), Executor (full scheduler loop),
+Waker (now re-enqueues instead of just unparking).
 
 ```
-run_queue: [Task A, Task B, Task C]
-     │
-     ▼
- pop front → poll
-   Ready  → drop task
-   Pending → task sits idle until waker re-pushes it
+spawn(future) → Arc<Task> → sender.send() → queue
+                                               │
+block_on runs the scheduler loop:              ▼
+    while let Ok(task) = receiver.recv() {   pop
+        poll(task)
+        Ready  → drop task
+        Pending → waker will re-send Arc<Task> later
+    }
 ```
 
 **Read first:** `tokio/src/runtime/scheduler/current_thread/mod.rs`
@@ -210,7 +243,8 @@ Worker 0: [T1, T2, T3] ◄── steals ── Worker 1: []
 |---|---|---|
 | Async task | `task::RawTask` | `Task` struct with `Box<dyn Future>` |
 | Task state | `task::State` (atomic) | simple `enum` or `AtomicU8` |
-| Waker | built from `task::waker` vtable | `RawWaker` + `thread::unpark` |
+| Waker (step 1) | built from `task::waker` vtable | `RawWaker` + `thread::unpark` |
+| Waker (step 2+) | built from `task::waker` vtable | `Wake` trait on `Arc<Task>` — re-enqueues via channel |
 | Run queue (1 thread) | `VecDeque` in `CurrentThread` | `VecDeque<Arc<Task>>` |
 | Run queue (N threads) | `crossbeam_deque::Worker` | `crossbeam-deque` |
 | Inject queue | `scheduler::inject::Shared` | `crossbeam_deque::Injector` |
