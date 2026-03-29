@@ -902,18 +902,54 @@ waker.wake()
 
 ### The Task struct
 
+A Task is not just a future wrapper. It's a **self-re-enqueueing** future wrapper.
+It has two jobs:
+1. **Hold the future** — so the executor can poll it
+2. **Know how to get back on the queue** — so the waker can re-enqueue it
+
+Why does the task need to know about the queue? Because of how waking works:
+
+```
+future returns Pending
+    → stores waker
+    → ... time passes ...
+    → something calls waker.wake()
+    → wake() must put this task back on the queue
+
+But the waker is built from Arc<Task>.
+If Task only holds the future, wake() has the future but no queue.
+The task must carry its own "return ticket" — a Sender to the queue.
+```
+
+Without the sender:
+```
+wake() fires → Arc<Task> has the future... but where's the queue? → stuck
+```
+
+With the sender:
+```
+wake() fires → Arc<Task> has the future AND sender → sender.send(self) → back on queue!
+```
+
 ```rust
 struct Task {
     future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    sender: mpsc::Sender<Arc<Task>>,   // handle to re-enqueue ourselves
+    sender: Mutex<Sender<Arc<Task>>>,   // the return ticket to the queue
 }
 ```
 
-**Why `Mutex`?** The waker might call `wake()` from another thread. Even though
-our scheduler is single-threaded, the contract says wakers must be `Send + Sync`.
-The `Mutex` makes `Task` safe to share. In practice, only one thread ever locks it.
+**Why `Mutex` on the future?** The waker might call `wake()` from another thread.
+Even though our scheduler is single-threaded, the contract says wakers must be
+`Send + Sync`. `Mutex` makes `Task` safe to share through `Arc`. In practice,
+only one thread ever locks it.
 
-**Why `Pin<Box<dyn Future>>`?** Two reasons:
+**Why `Mutex` on the sender?** `mpsc::Sender` is `Send` but not `Sync` — it can
+be moved to another thread but can't be shared by reference across threads.
+Since `Arc<Task>` gives `&Task` (shared reference) to anyone holding it, and
+the waker might call `wake()` from any thread, we need `Mutex` to make
+`&Sender` safe. The Mutex turns "not Sync" into "Sync".
+
+**Why `Pin<Box<dyn Future>>`?** Three reasons:
 - `Box` puts it on the heap (required — tasks outlive the `spawn` call)
 - `Pin` guarantees the future won't move (required by `poll`)
 - `dyn Future` erases the concrete type (required — queue holds mixed futures)
